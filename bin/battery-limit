@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# battery-limit: dynamic charge-threshold manager for ThinkPads (thinkpad_acpi sysfs).
+# Usage: battery-limit {auto|daily|full|status}
+set -euo pipefail
+
+PS="${PS_ROOT:-/sys/class/power_supply}"
+CONF="${BATTERY_LIMIT_CONF:-/etc/battery-limit.conf}"
+STATE_DIR="${BATTERY_LIMIT_STATE:-/var/lib/battery-limit}"
+FLAG="$STATE_DIR/full-once"
+
+DAILY_START=75      # begin charging below this percentage
+DAILY_STOP=80       # stop charging above this percentage
+FULL_REVERT_AT=95   # after a "full" charge, revert to daily once unplugged at or above this
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+die() { echo "battery-limit: $*" >&2; exit 1; }
+
+validate() {
+  [[ $DAILY_START =~ ^[0-9]+$ && $DAILY_STOP =~ ^[0-9]+$ && $FULL_REVERT_AT =~ ^[0-9]+$ ]] \
+    || die "thresholds in $CONF must be integers"
+  [ "$DAILY_START" -lt "$DAILY_STOP" ] && [ "$DAILY_STOP" -le 100 ] \
+    || die "need DAILY_START < DAILY_STOP <= 100"
+}
+
+ac_online() {
+  local f d
+  for f in "$PS"/*/online; do
+    [ -r "$f" ] || continue
+    d=${f%/online}
+    [ "$(cat "$d/type" 2>/dev/null)" = Mains ] && [ "$(cat "$f")" = 1 ] && return 0
+  done
+  return 1
+}
+
+capacity() { cat "$PS"/BAT*/capacity 2>/dev/null | head -n1; }
+
+# Write start/stop in an order the driver accepts (it requires start < stop at all times).
+set_thresholds() {
+  local b=$1 start=$2 stop=$3
+  local sf="$b/charge_control_start_threshold" ef="$b/charge_control_end_threshold"
+  local cur_start cur_stop
+  cur_stop=$(cat "$ef")
+  cur_start=$(cat "$sf" 2>/dev/null || echo "$start")
+  [ "$cur_start" = "$start" ] && [ "$cur_stop" = "$stop" ] && return 0
+  if [ "$start" -ge "$cur_stop" ]; then
+    echo "$stop" > "$ef"
+    [ -w "$sf" ] && echo "$start" > "$sf"
+  else
+    [ -w "$sf" ] && echo "$start" > "$sf"
+    echo "$stop" > "$ef"
+  fi
+  return 0
+}
+
+apply() {
+  local b found=0
+  for b in "$PS"/BAT*; do
+    [ -w "$b/charge_control_end_threshold" ] || continue
+    found=1
+    set_thresholds "$b" "$1" "$2"
+  done
+  [ "$found" = 1 ] || die "no writable charge_control_end_threshold (need root, or unsupported battery)"
+}
+
+auto() {
+  if [ -e "$FLAG" ]; then
+    # Stay at full while on AC, or while unplugged below the revert level (early unplug).
+    if ac_online || [ "$(capacity)" -lt "$FULL_REVERT_AT" ]; then
+      apply 0 100
+      return
+    fi
+    rm -f "$FLAG"
+  fi
+  apply "$DAILY_START" "$DAILY_STOP"
+}
+
+status() {
+  local b
+  for b in "$PS"/BAT*; do
+    [ -r "$b/charge_control_end_threshold" ] || continue
+    echo "${b##*/}: $(cat "$b/capacity")% $(cat "$b/status") | start=$(cat "$b/charge_control_start_threshold" 2>/dev/null || echo n/a) stop=$(cat "$b/charge_control_end_threshold")"
+  done
+  echo "AC online: $(ac_online && echo yes || echo no)"
+  echo "Full-charge-once pending: $([ -e "$FLAG" ] && echo yes || echo no)"
+  echo "Daily profile: start=$DAILY_START stop=$DAILY_STOP"
+  if systemctl is-active --quiet tlp 2>/dev/null; then
+    echo "WARNING: tlp is active and may overwrite thresholds; set STOP_CHARGE_THRESH_BAT0 there or disable it."
+  fi
+}
+
+validate
+case "${1:-}" in
+  auto)   auto ;;
+  daily)  rm -f "$FLAG"; auto ;;
+  full)   mkdir -p "$STATE_DIR"; : > "$FLAG"; auto ;;
+  status) status ;;
+  *) die "usage: battery-limit {auto|daily|full|status}" ;;
+esac

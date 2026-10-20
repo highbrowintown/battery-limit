@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply dynamic battery charge thresholds
+After=suspend.target hibernate.target hybrid-sleep.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/battery-limit auto
+
+[Install]
+WantedBy=multi-user.target suspend.target hibernate.target hybrid-sleep.target
